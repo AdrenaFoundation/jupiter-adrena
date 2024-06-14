@@ -1,23 +1,29 @@
 use adrena::{
     accounts::Swap,
-    state::{custody::Custody, oracle::OraclePrice, pool::Pool},
+    state::{
+        custody::Custody,
+        oracle::{OracleParams, OraclePrice},
+        pool::Pool,
+    },
 };
-use anchor_lang::{AccountDeserialize, ToAccountMetas};
+use anchor_lang::{AccountDeserialize, AnchorDeserialize, ToAccountMetas};
 use anyhow::anyhow;
+use anyhow::Context;
 use chrono::{DateTime, Utc};
 use jupiter_amm_interface::{try_get_account_data, Amm, AmmContext, Quote, SwapAndAccountMetas};
+use num_traits::FromPrimitive;
 use rust_decimal::Decimal;
 use solana_sdk::pubkey as key;
-use solana_sdk::{instruction::AccountMeta, pubkey::Pubkey};
+use solana_sdk::pubkey::Pubkey;
 use std::collections::HashMap;
 
-// mod generated;
-// mod math;
-// mod oracle;
-
-//TODO First iteration, let me to push the second before reviewing stuff and put TODO
-
 const SPL_TOKEN_ID: Pubkey = key!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+
+const PROTOCOL_FEE_RECIPIENT: Pubkey = key!("5STGJRnjLKbssEkk5AmKpqebPLt5yk71RMFmGtxWwjgG");
+const FEE_REDISTRIBUTION_MINT: Pubkey = key!("3jdYcGYZaQVvcvMQGqVpt37JegEoDDnX7k4gSGAeGRqG");
+
+//TODO: staking_reward_token_custody_oracle_account
+// const REWARD_ORACLE_ACCOUNT: Pubkey = key!("")
 
 #[derive(Clone, Debug)]
 pub enum UpdateStatus {
@@ -25,7 +31,7 @@ pub enum UpdateStatus {
     OraclesAndTokens,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PoolAmm {
     key: Pubkey,
     state: Pool,
@@ -46,7 +52,7 @@ impl Amm for PoolAmm {
     //TODO work with the new amm interface
     fn from_keyed_account(
         keyed_account: &jupiter_amm_interface::KeyedAccount,
-        amm_context: &AmmContext,
+        _amm_context: &AmmContext,
     ) -> anyhow::Result<Self>
     where
         Self: Sized,
@@ -124,12 +130,11 @@ impl Amm for PoolAmm {
                 let oracle_keys = self.custodies.values().map(|c| c.oracle.oracle_account);
 
                 for oracle_key in oracle_keys {
-                    // let oracle = OraclePrice::
-                    // let custody = OraclePrice::try_deserialize(&mut try_get_account_data(
-                    //     account_map,
-                    //     custody_key,
-                    // )?)?;
-                    // self.custodies.insert(*custody_key, custody);
+                    let oracle_price = OraclePrice::try_from_slice(&try_get_account_data(
+                        account_map,
+                        &oracle_key,
+                    )?)?;
+                    self.oracle_prices.insert(oracle_key, oracle_price);
                 }
 
                 self.update_status = UpdateStatus::Custodies;
@@ -180,7 +185,7 @@ impl Amm for PoolAmm {
         let token_id_in = self.state.get_token_id(&custody_in_pubkey)?;
         let token_id_out = self.state.get_token_id(&custody_out_pubkey)?;
 
-        let amount_out = self.state.get_swap_amount(
+        let out_amount = self.state.get_swap_amount(
             &token_price_in,
             &token_price_out,
             &custody_in,
@@ -192,23 +197,31 @@ impl Amm for PoolAmm {
             token_id_in,
             token_id_out,
             quote_params.amount,
-            amount_out,
+            out_amount,
             &custody_in,
             &token_price_in,
             &custody_out,
             &token_price_out,
         )?;
 
-        let no_fee_amount = amount_out - fees.1;
+        let fee_amount = fees.0 + fees.1;
+
+        let out_dec = Decimal::from_u64(out_amount).with_context(|| "Can't convert out_amount")?;
+        let fee_dec = Decimal::from_u64(fee_amount).with_context(|| "Can't convert fee_amount")?;
+
+        let fee_pct = Decimal::ONE_HUNDRED
+            .checked_mul(out_dec)
+            .and_then(|per| per.checked_div(fee_dec))
+            .ok_or(anyhow!("Can't calculate fee percentage"))?;
 
         let quote = Quote {
-            fee_amount: fees.1,
+            fee_amount,
             min_out_amount: None,
             min_in_amount: None,
             fee_mint: quote_params.input_mint,
-            fee_pct: Decimal::TEN,
+            fee_pct,
             in_amount: quote_params.amount,
-            out_amount: no_fee_amount,
+            out_amount,
         };
         Ok(quote)
     }
@@ -217,8 +230,6 @@ impl Amm for PoolAmm {
         &self,
         swap_params: &jupiter_amm_interface::SwapParams,
     ) -> anyhow::Result<jupiter_amm_interface::SwapAndAccountMetas> {
-        let pda = |seeds: &[&[u8]]| Pubkey::find_program_address(seeds, &self.program_id).0;
-
         let (dispensing_custody, dispensing_cust_state) = self
             .custodies
             .iter()
@@ -243,15 +254,26 @@ impl Amm for PoolAmm {
         let receiving_custody_oracle_account = receiving_cust_state.oracle.oracle_account;
         let receiving_custody_token_account = receiving_cust_state.token_account;
         let owner = swap_params.token_transfer_authority;
-        let lp_token_mint = pda(&[b"lp_token_mint", self.key.as_ref()]);
-        let lp_staking = pda(&[b"staking", lp_token_mint.as_ref()]);
-        let lm_staking = pda(&[b"staking"]); //TODO staked token
-        let cortex = pda(&[b"cortex"]);
-        let user_profile = pda(&[b"user_profile", owner.as_ref()]);
+        let lp_token_mint = self.pda(&[b"lp_token_mint", self.key.as_ref()]);
+        let lp_staking = self.pda(&[b"staking", lp_token_mint.as_ref()]);
+        let lm_staking = self.pda(&[b"staking"]); //TODO staked token
+        let cortex = self.pda(&[b"cortex"]);
+        let user_profile = self.pda(&[b"user_profile", owner.as_ref()]);
         let lm_staking_reward_token_vault =
-            pda(&[b"staking_reward_token_vault", lm_staking.as_ref()]);
+            self.pda(&[b"staking_reward_token_vault", lm_staking.as_ref()]);
         let lp_staking_reward_token_vault =
-            pda(&[b"staking_reward_token_vault", lp_staking.as_ref()]);
+            self.pda(&[b"staking_reward_token_vault", lp_staking.as_ref()]);
+        let staking_reward_token_custody = self.pda(&[
+            b"custody",
+            self.key.as_ref(),
+            FEE_REDISTRIBUTION_MINT.as_ref(),
+        ]);
+        // let staking_reward_token_custody_oracle_account = pda();
+        let staking_reward_token_custody_token_account = self.pda(&[
+            b"custody_token_account",
+            self.key.as_ref(),
+            FEE_REDISTRIBUTION_MINT.as_ref(),
+        ]);
 
         let account_metas = Swap {
             owner,
@@ -262,9 +284,9 @@ impl Amm for PoolAmm {
             lm_staking,
             lp_staking,
             pool: self.key,
-            staking_reward_token_custody: todo!(),
+            staking_reward_token_custody,
             staking_reward_token_custody_oracle_account: todo!(),
-            staking_reward_token_custody_token_account: todo!(),
+            staking_reward_token_custody_token_account,
             receiving_custody: *receiving_custody,
             receiving_custody_oracle_account,
             receiving_custody_token_account,
@@ -274,10 +296,10 @@ impl Amm for PoolAmm {
             lm_staking_reward_token_vault,
             lp_staking_reward_token_vault,
             lp_token_mint,
-            protocol_fee_recipient: todo!(),
+            protocol_fee_recipient: PROTOCOL_FEE_RECIPIENT,
             user_profile: Some(user_profile),
             token_program: SPL_TOKEN_ID,
-            adrena_program: adrena::ID,
+            adrena_program: self.program_id,
         }
         .to_account_metas(None);
 
