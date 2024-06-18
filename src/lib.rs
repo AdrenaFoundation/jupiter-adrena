@@ -2,20 +2,21 @@ use adrena::{
     accounts::Swap,
     state::{
         custody::Custody,
-        oracle::{OracleParams, OraclePrice},
+        oracle::{OracleParams, OraclePrice, OracleType},
         pool::Pool,
     },
 };
-use anchor_lang::{AccountDeserialize, AnchorDeserialize, ToAccountMetas};
+use anchor_lang::{system_program, AccountDeserialize, ToAccountMetas};
 use anyhow::anyhow;
 use anyhow::Context;
-use chrono::{DateTime, Utc};
-use jupiter_amm_interface::{try_get_account_data, Amm, AmmContext, Quote, SwapAndAccountMetas};
+use jupiter_amm_interface::{
+    try_get_account_data, Amm, AmmContext, ClockRef, Quote, SwapAndAccountMetas,
+};
 use num_traits::FromPrimitive;
 use rust_decimal::Decimal;
-use solana_sdk::pubkey as key;
-use solana_sdk::pubkey::Pubkey;
-use std::collections::HashMap;
+use solana_sdk::{account_info::IntoAccountInfo, pubkey::Pubkey};
+use solana_sdk::{clock::Clock, pubkey as key, sysvar::SysvarId};
+use std::{collections::HashMap, sync::atomic::Ordering};
 
 const SPL_TOKEN_ID: Pubkey = key!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 
@@ -38,8 +39,8 @@ pub struct PoolAmm {
     custodies: HashMap<Pubkey, Custody>,
     oracle_prices: HashMap<Pubkey, OraclePrice>,
     program_id: Pubkey,
-    current_time: DateTime<Utc>,
     update_status: UpdateStatus,
+    clock_ref: ClockRef,
 }
 
 impl PoolAmm {
@@ -52,7 +53,7 @@ impl Amm for PoolAmm {
     //TODO work with the new amm interface
     fn from_keyed_account(
         keyed_account: &jupiter_amm_interface::KeyedAccount,
-        _amm_context: &AmmContext,
+        amm_context: &AmmContext,
     ) -> anyhow::Result<Self>
     where
         Self: Sized,
@@ -61,12 +62,12 @@ impl Amm for PoolAmm {
 
         Ok(PoolAmm {
             key: keyed_account.key,
-            program_id: keyed_account.key,
+            program_id: keyed_account.account.owner,
             state: pool,
             custodies: HashMap::new(),
             oracle_prices: HashMap::new(),
-            current_time: Utc::now(),
             update_status: UpdateStatus::Custodies,
+            clock_ref: amm_context.clock_ref.clone(),
         })
     }
 
@@ -95,7 +96,14 @@ impl Amm for PoolAmm {
             UpdateStatus::Custodies => {
                 let mut keys = vec![self.key];
 
-                keys.append(&mut self.state.custodies.to_vec());
+                keys.append(
+                    &mut self
+                        .state
+                        .custodies
+                        .into_iter()
+                        .filter(|acc| *acc != system_program::ID)
+                        .collect(),
+                );
                 keys
             }
             UpdateStatus::OraclesAndTokens => self
@@ -107,7 +115,11 @@ impl Amm for PoolAmm {
     }
 
     fn update(&mut self, account_map: &jupiter_amm_interface::AccountMap) -> anyhow::Result<()> {
-        self.current_time = Utc::now();
+        let clock = account_map
+            .get(&Clock::id())
+            .with_context(|| format!("Could not find address: {}", Clock::id()))?
+            .deserialize_data()?;
+        self.clock_ref.update(clock);
 
         match self.update_status {
             UpdateStatus::Custodies => {
@@ -117,11 +129,13 @@ impl Amm for PoolAmm {
                 self.state = pool_state;
 
                 for custody_key in &self.state.custodies {
-                    let custody = Custody::try_deserialize(&mut try_get_account_data(
-                        account_map,
-                        custody_key,
-                    )?)?;
-                    self.custodies.insert(*custody_key, custody);
+                    if *custody_key != system_program::ID {
+                        let custody = Custody::try_deserialize(&mut try_get_account_data(
+                            account_map,
+                            custody_key,
+                        )?)?;
+                        self.custodies.insert(*custody_key, custody);
+                    }
                 }
 
                 self.update_status = UpdateStatus::OraclesAndTokens;
@@ -130,10 +144,20 @@ impl Amm for PoolAmm {
                 let oracle_keys = self.custodies.values().map(|c| c.oracle.oracle_account);
 
                 for oracle_key in oracle_keys {
-                    let oracle_price = OraclePrice::try_from_slice(&try_get_account_data(
-                        account_map,
-                        &oracle_key,
-                    )?)?;
+                    let oracle_account = account_map
+                        .get(&oracle_key)
+                        .with_context(|| format!("Could not find address: {oracle_key}"))?
+                        .to_owned();
+
+                    let oracle_price = OraclePrice::new_from_oracle(
+                        &(oracle_key, oracle_account).into_account_info(),
+                        &OracleParams {
+                            oracle_type: OracleType::Pyth.into(),
+                            ..Default::default()
+                        },
+                        self.clock_ref.unix_timestamp.load(Ordering::Relaxed),
+                    )?;
+
                     self.oracle_prices.insert(oracle_key, oracle_price);
                 }
 
@@ -210,8 +234,8 @@ impl Amm for PoolAmm {
         let fee_dec = Decimal::from_u64(fee_amount).with_context(|| "Can't convert fee_amount")?;
 
         let fee_pct = Decimal::ONE_HUNDRED
-            .checked_mul(out_dec)
-            .and_then(|per| per.checked_div(fee_dec))
+            .checked_mul(fee_dec)
+            .and_then(|per| per.checked_div(out_dec))
             .ok_or(anyhow!("Can't calculate fee percentage"))?;
 
         let quote = Quote {
