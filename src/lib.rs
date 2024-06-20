@@ -22,6 +22,7 @@ const SPL_TOKEN_ID: Pubkey = key!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
 
 const PROTOCOL_FEE_RECIPIENT: Pubkey = key!("5STGJRnjLKbssEkk5AmKpqebPLt5yk71RMFmGtxWwjgG");
 const FEE_REDISTRIBUTION_MINT: Pubkey = key!("3jdYcGYZaQVvcvMQGqVpt37JegEoDDnX7k4gSGAeGRqG");
+const REWARD_ORACLE_ACCOUNT: Pubkey = key!("5SSkXsEKQepHHAewytPVwdej4epN1nxgLVM84L4KXgy7");
 
 //TODO: staking_reward_token_custody_oracle_account
 // const REWARD_ORACLE_ACCOUNT: Pubkey = key!("")
@@ -271,10 +272,8 @@ impl Amm for PoolAmm {
                 swap_params.destination_mint
             ))?;
 
-        let dispensing_custody_mint = swap_params.source_mint;
         let dispensing_custody_oracle_account = dispensing_cust_state.oracle.oracle_account;
         let dispensing_custody_token_account = dispensing_cust_state.token_account;
-        let receiving_custody_mint = swap_params.destination_mint;
         let receiving_custody_oracle_account = receiving_cust_state.oracle.oracle_account;
         let receiving_custody_token_account = receiving_cust_state.token_account;
         let owner = swap_params.token_transfer_authority;
@@ -292,7 +291,6 @@ impl Amm for PoolAmm {
             self.key.as_ref(),
             FEE_REDISTRIBUTION_MINT.as_ref(),
         ]);
-        // let staking_reward_token_custody_oracle_account = pda();
         let staking_reward_token_custody_token_account = self.pda(&[
             b"custody_token_account",
             self.key.as_ref(),
@@ -309,7 +307,7 @@ impl Amm for PoolAmm {
             lp_staking,
             pool: self.key,
             staking_reward_token_custody,
-            staking_reward_token_custody_oracle_account: todo!(),
+            staking_reward_token_custody_oracle_account: REWARD_ORACLE_ACCOUNT,
             staking_reward_token_custody_token_account,
             receiving_custody: *receiving_custody,
             receiving_custody_oracle_account,
