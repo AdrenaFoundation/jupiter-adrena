@@ -23,6 +23,7 @@ const SPL_TOKEN_ID: Pubkey = key!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
 const PROTOCOL_FEE_RECIPIENT: Pubkey = key!("5STGJRnjLKbssEkk5AmKpqebPLt5yk71RMFmGtxWwjgG");
 const FEE_REDISTRIBUTION_MINT: Pubkey = key!("3jdYcGYZaQVvcvMQGqVpt37JegEoDDnX7k4gSGAeGRqG");
 const REWARD_ORACLE_ACCOUNT: Pubkey = key!("5SSkXsEKQepHHAewytPVwdej4epN1nxgLVM84L4KXgy7");
+const LM_STAKING: Pubkey = key!("AUP8PVY9gC5VGmTdyZLVB2DskLeScKGxY5VeZtZN7hFR");
 
 //TODO: staking_reward_token_custody_oracle_account
 // const REWARD_ORACLE_ACCOUNT: Pubkey = key!("")
@@ -279,11 +280,10 @@ impl Amm for PoolAmm {
         let owner = swap_params.token_transfer_authority;
         let lp_token_mint = self.pda(&[b"lp_token_mint", self.key.as_ref()]);
         let lp_staking = self.pda(&[b"staking", lp_token_mint.as_ref()]);
-        let lm_staking = self.pda(&[b"staking"]); //TODO staked token
         let cortex = self.pda(&[b"cortex"]);
         let user_profile = self.pda(&[b"user_profile", owner.as_ref()]);
         let lm_staking_reward_token_vault =
-            self.pda(&[b"staking_reward_token_vault", lm_staking.as_ref()]);
+            self.pda(&[b"staking_reward_token_vault", LM_STAKING.as_ref()]);
         let lp_staking_reward_token_vault =
             self.pda(&[b"staking_reward_token_vault", lp_staking.as_ref()]);
         let staking_reward_token_custody = self.pda(&[
@@ -303,7 +303,7 @@ impl Amm for PoolAmm {
             receiving_account: swap_params.destination_token_account,
             transfer_authority: owner,
             cortex,
-            lm_staking,
+            lm_staking: LM_STAKING,
             lp_staking,
             pool: self.key,
             staking_reward_token_custody,
