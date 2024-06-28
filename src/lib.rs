@@ -232,12 +232,13 @@ impl Amm for PoolAmm {
 
         let fee_amount = fees.0 + fees.1;
 
-        let out_dec = Decimal::from_u64(out_amount).with_context(|| "Can't convert out_amount")?;
+        let in_dec =
+            Decimal::from_u64(quote_params.amount).with_context(|| "Can't convert out_amount")?;
         let fee_dec = Decimal::from_u64(fee_amount).with_context(|| "Can't convert fee_amount")?;
 
         let fee_pct = Decimal::ONE_HUNDRED
             .checked_mul(fee_dec)
-            .and_then(|per| per.checked_div(out_dec))
+            .and_then(|per| per.checked_div(in_dec))
             .ok_or(anyhow!("Can't calculate fee percentage"))?;
 
         let quote = Quote {
