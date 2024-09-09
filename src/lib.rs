@@ -5,13 +5,10 @@ use adrena::{
 use anchor_lang::{system_program, AccountDeserialize, ToAccountMetas};
 use anyhow::anyhow;
 use anyhow::Context;
-use jupiter_amm_interface::{
-    try_get_account_data, Amm, AmmContext, ClockRef, Quote, SwapAndAccountMetas,
-};
+use jupiter_amm_interface::{try_get_account_data, Amm, AmmContext, Quote, SwapAndAccountMetas};
 use num_traits::FromPrimitive;
 use rust_decimal::Decimal;
-use solana_sdk::{account_info::IntoAccountInfo, pubkey::Pubkey};
-use solana_sdk::{clock::Clock, pubkey as key, sysvar::SysvarId};
+use solana_sdk::{account_info::IntoAccountInfo, pubkey as key, pubkey::Pubkey};
 use std::collections::HashMap;
 
 const SPL_TOKEN_ID: Pubkey = key!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
@@ -45,7 +42,6 @@ pub struct PoolAmm {
     oracle_prices: HashMap<Pubkey, OraclePrice>,
     program_id: Pubkey,
     update_type: UpdateType,
-    clock_ref: ClockRef,
 }
 
 impl PoolAmm {
@@ -115,7 +111,7 @@ impl PoolAmm {
 impl Amm for PoolAmm {
     fn from_keyed_account(
         keyed_account: &jupiter_amm_interface::KeyedAccount,
-        amm_context: &AmmContext,
+        _amm_context: &AmmContext,
     ) -> anyhow::Result<Self> {
         let pool = Pool::try_deserialize(&mut &keyed_account.account.data[..])?;
 
@@ -126,7 +122,6 @@ impl Amm for PoolAmm {
             custodies: HashMap::new(),
             oracle_prices: HashMap::new(),
             update_type: UpdateType::Custodies,
-            clock_ref: amm_context.clock_ref.clone(),
         })
     }
 
@@ -181,12 +176,6 @@ impl Amm for PoolAmm {
     }
 
     fn update(&mut self, account_map: &jupiter_amm_interface::AccountMap) -> anyhow::Result<()> {
-        let clock = account_map
-            .get(&Clock::id())
-            .with_context(|| format!("Could not find address: {}", Clock::id()))?
-            .deserialize_data()?;
-        self.clock_ref.update(clock);
-
         match self.update_type {
             UpdateType::Custodies => {
                 let pool =
