@@ -1,10 +1,6 @@
 use adrena::{
     accounts::Swap,
-    state::{
-        custody::Custody,
-        oracle::{OracleParams, OraclePrice, OracleType},
-        pool::Pool,
-    },
+    state::{custody::Custody, oracle::OraclePrice, pool::Pool},
 };
 use anchor_lang::{system_program, AccountDeserialize, ToAccountMetas};
 use anyhow::anyhow;
@@ -16,7 +12,7 @@ use num_traits::FromPrimitive;
 use rust_decimal::Decimal;
 use solana_sdk::{account_info::IntoAccountInfo, pubkey::Pubkey};
 use solana_sdk::{clock::Clock, pubkey as key, sysvar::SysvarId};
-use std::{collections::HashMap, sync::atomic::Ordering};
+use std::collections::HashMap;
 
 const SPL_TOKEN_ID: Pubkey = key!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 
@@ -25,13 +21,20 @@ const FEE_REDISTRIBUTION_MINT: Pubkey = key!("3jdYcGYZaQVvcvMQGqVpt37JegEoDDnX7k
 const REWARD_ORACLE_ACCOUNT: Pubkey = key!("5SSkXsEKQepHHAewytPVwdej4epN1nxgLVM84L4KXgy7");
 const LM_STAKING: Pubkey = key!("AUP8PVY9gC5VGmTdyZLVB2DskLeScKGxY5VeZtZN7hFR");
 
-//TODO: staking_reward_token_custody_oracle_account
-// const REWARD_ORACLE_ACCOUNT: Pubkey = key!("")
-
 #[derive(Clone, Debug)]
 pub enum UpdateType {
     Custodies,
     OraclesAndTokens,
+}
+
+pub struct CalculateFeesParams<'a> {
+    in_oracle: &'a OraclePrice,
+    in_decimals: u8,
+    int_amount: u64,
+    out_oracle: &'a OraclePrice,
+    out_decimals: u8,
+    out_amount: u64,
+    fees: (u64, u64),
 }
 
 #[derive(Clone)]
@@ -41,7 +44,7 @@ pub struct PoolAmm {
     custodies: HashMap<Pubkey, Custody>,
     oracle_prices: HashMap<Pubkey, OraclePrice>,
     program_id: Pubkey,
-    update_status: UpdateType,
+    update_type: UpdateType,
     clock_ref: ClockRef,
 }
 
@@ -49,13 +52,71 @@ impl PoolAmm {
     fn pda(&self, seeds: &[&[u8]]) -> Pubkey {
         Pubkey::find_program_address(seeds, &self.program_id).0
     }
+
+    fn get_custody_and_oracle(
+        &self,
+        mint: Pubkey,
+    ) -> anyhow::Result<(Pubkey, &Custody, &OraclePrice)> {
+        let custody_key = self.pda(&[b"custody", self.pool_key.as_ref(), mint.as_ref()]);
+
+        let custody = self
+            .custodies
+            .get(&custody_key)
+            .context(format!("Custody does not exist: {custody_key}"))?;
+
+        let oracle_price = self
+            .oracle_prices
+            .get(&custody.oracle.oracle_account)
+            .context(format!(
+                "Oracle does not exist: {}",
+                custody.oracle.oracle_account
+            ))?;
+
+        Ok((custody_key, custody, oracle_price))
+    }
+
+    fn calculate_fees(
+        &self,
+        CalculateFeesParams {
+            in_oracle,
+            in_decimals,
+            int_amount,
+            out_oracle,
+            out_decimals,
+            out_amount,
+            fees,
+        }: CalculateFeesParams,
+    ) -> anyhow::Result<(u64, Decimal)> {
+        let (_, fees_custody, fees_price) = self.get_custody_and_oracle(FEE_REDISTRIBUTION_MINT)?;
+
+        let fees_in_usd = in_oracle.get_asset_amount_usd(fees.0, in_decimals)?;
+        let fees_out_usd = out_oracle.get_asset_amount_usd(fees.1, out_decimals)?;
+        let in_usd = in_oracle.get_asset_amount_usd(int_amount, in_decimals)?;
+        let out_usd = out_oracle.get_asset_amount_usd(out_amount, out_decimals)?;
+
+        let total_amount = in_usd + out_usd;
+        let total_fees = fees_in_usd + fees_out_usd;
+
+        let total_amount_dec =
+            Decimal::from_u64(total_amount).context("Can't convert out_amount")?;
+        let total_fees_dec = Decimal::from_u64(total_fees).context("Can't convert out_amount")?;
+
+        let fee_pct = Decimal::ONE_HUNDRED
+            .checked_mul(total_fees_dec)
+            .and_then(|per| per.checked_div(total_amount_dec))
+            .context("Can't calculate fee percentage")?;
+
+        let reward_fees = fees_price.get_token_amount(total_fees, fees_custody.decimals)?;
+
+        Ok((reward_fees, fee_pct))
+    }
 }
 
 impl Amm for PoolAmm {
-    fn from_keyed_account(keyed_account: &KeyedAccount) -> Result<Self>
-    where
-        Self: Sized;
-    {
+    fn from_keyed_account(
+        keyed_account: &jupiter_amm_interface::KeyedAccount,
+        amm_context: &AmmContext,
+    ) -> anyhow::Result<Self> {
         let pool = Pool::try_deserialize(&mut &keyed_account.account.data[..])?;
 
         Ok(PoolAmm {
@@ -70,7 +131,7 @@ impl Amm for PoolAmm {
     }
 
     fn label(&self) -> String {
-        self.state.name.to_string()
+        self.pool.name.to_string()
     }
 
     fn program_id(&self) -> Pubkey {
@@ -98,7 +159,7 @@ impl Amm for PoolAmm {
 
                 keys.append(
                     &mut self
-                        .state
+                        .pool
                         .custodies
                         .into_iter()
                         .filter(|acc| *acc != system_program::ID)
@@ -133,7 +194,7 @@ impl Amm for PoolAmm {
 
                 self.pool = pool;
 
-                for custody_key in &self.state.custodies {
+                for custody_key in &self.pool.custodies {
                     if *custody_key != system_program::ID {
                         let custody = Custody::try_deserialize(&mut try_get_account_data(
                             account_map,
@@ -154,13 +215,8 @@ impl Amm for PoolAmm {
                         .with_context(|| format!("Could not find address: {oracle_key}"))?
                         .to_owned();
 
-                    let oracle_price = OraclePrice::new_from_oracle(
+                    let oracle_price = OraclePrice::new_from_pyth_price_update_v2_account_info(
                         &(oracle_key, oracle_account).into_account_info(),
-                        &OracleParams {
-                            oracle_type: OracleType::Pyth.into(),
-                            ..Default::default()
-                        },
-                        self.clock_ref.unix_timestamp.load(Ordering::Relaxed),
                     )?;
 
                     self.oracle_prices.insert(oracle_key, oracle_price);
@@ -180,78 +236,62 @@ impl Amm for PoolAmm {
         let custody_in_mint = quote_params.input_mint;
         let custody_out_mint = quote_params.output_mint;
 
-        let custody_in_pubkey =
-            self.pda(&[b"custody", self.pool_key.as_ref(), custody_in_mint.as_ref()]);
-        let custody_out_pubkey =
-            self.pda(&[b"custody", self.pool_key.as_ref(), custody_out_mint.as_ref()]);
+        let (custody_in_pubkey, custody_in, token_price_in) =
+            self.get_custody_and_oracle(custody_in_mint)?;
+        let (custody_out_pubkey, custody_out, token_price_out) =
+            self.get_custody_and_oracle(custody_out_mint)?;
 
-        let custody_in = self
-            .custodies
-            .get(&custody_in_pubkey)
-            .ok_or(anyhow!("Custody does not exist: {}", custody_in_pubkey))?;
+        let token_id_in = self.pool.get_token_id(&custody_in_pubkey)?;
+        let token_id_out = self.pool.get_token_id(&custody_out_pubkey)?;
 
-        let custody_out = self
-            .custodies
-            .get(&custody_out_pubkey)
-            .ok_or(anyhow!("Custody does not exist {}", custody_out_pubkey))?;
-
-        let token_price_in = self
-            .oracle_prices
-            .get(&custody_in.oracle.oracle_account)
-            .ok_or(anyhow!(
-                "Oracle does not exist: {}",
-                custody_in.oracle.oracle_account
-            ))?;
-
-        let token_price_out = self
-            .oracle_prices
-            .get(&custody_out.oracle.oracle_account)
-            .ok_or(anyhow!(
-                "Oracle does not exist: {}",
-                custody_out.oracle.oracle_account
-            ))?;
-
-        let token_id_in = self.state.get_token_id(&custody_in_pubkey)?;
-        let token_id_out = self.state.get_token_id(&custody_out_pubkey)?;
-
-        let out_amount = self.state.get_swap_amount(
-            &token_price_in,
-            &token_price_out,
-            &custody_in,
-            &custody_out,
+        let out_amount = self.pool.get_swap_amount(
+            token_price_in,
+            token_price_out,
+            custody_in,
+            custody_out,
             quote_params.amount,
         )?;
 
-        let fees = self.state.get_swap_fees(
-            token_id_in,
-            token_id_out,
-            quote_params.amount,
+        let fees = {
+            let swap_fees_in = self.pool.get_swap_in_fees(
+                token_id_in,
+                quote_params.amount,
+                custody_in,
+                token_price_in,
+                custody_out,
+            )?;
+
+            let swap_fees_out = self.pool.get_swap_out_fees(
+                token_id_out,
+                out_amount,
+                custody_in,
+                custody_out,
+                token_price_out,
+            )?;
+
+            (swap_fees_in, swap_fees_out)
+        };
+
+        let real_out_amount = out_amount - fees.1;
+
+        let (fee_amount, fee_pct) = self.calculate_fees(CalculateFeesParams {
+            fees,
+            in_decimals: custody_in.decimals,
+            in_oracle: token_price_in,
+            int_amount: quote_params.amount,
             out_amount,
-            &custody_in,
-            &token_price_in,
-            &custody_out,
-            &token_price_out,
-        )?;
-
-        let fee_amount = fees.0 + fees.1;
-
-        let in_dec =
-            Decimal::from_u64(quote_params.amount).with_context(|| "Can't convert out_amount")?;
-        let fee_dec = Decimal::from_u64(fee_amount).with_context(|| "Can't convert fee_amount")?;
-
-        let fee_pct = Decimal::ONE_HUNDRED
-            .checked_mul(fee_dec)
-            .and_then(|per| per.checked_div(in_dec))
-            .ok_or(anyhow!("Can't calculate fee percentage"))?;
+            out_decimals: custody_out.decimals,
+            out_oracle: token_price_out,
+        })?;
 
         let quote = Quote {
             fee_amount,
             min_out_amount: None,
             min_in_amount: None,
-            fee_mint: quote_params.input_mint,
+            fee_mint: FEE_REDISTRIBUTION_MINT,
             fee_pct,
             in_amount: quote_params.amount,
-            out_amount,
+            out_amount: real_out_amount,
         };
         Ok(quote)
     }
@@ -280,7 +320,10 @@ impl Amm for PoolAmm {
         let lp_token_mint = self.pda(&[b"lp_token_mint", self.pool_key.as_ref()]);
         let lp_staking = self.pda(&[b"staking", lp_token_mint.as_ref()]);
         let cortex = self.pda(&[b"cortex"]);
-        let user_profile = self.pda(&[b"user_profile", owner.as_ref()]);
+        let user_profile = self.pda(&[
+            b"user_profile",
+            swap_params.token_transfer_authority.as_ref(),
+        ]);
         let lm_staking_reward_token_vault =
             self.pda(&[b"staking_reward_token_vault", LM_STAKING.as_ref()]);
         let lp_staking_reward_token_vault =
@@ -300,7 +343,7 @@ impl Amm for PoolAmm {
             owner: swap_params.token_transfer_authority,
             funding_account: swap_params.source_token_account,
             receiving_account: swap_params.destination_token_account,
-            transfer_authority: owner,
+            transfer_authority: swap_params.token_transfer_authority,
             cortex,
             lm_staking: LM_STAKING,
             lp_staking,
