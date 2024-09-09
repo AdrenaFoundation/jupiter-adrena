@@ -1,9 +1,8 @@
-use std::collections::HashMap;
-
 use jupiter_adrena::PoolAmm;
 use jupiter_amm_interface::{Amm, AmmContext, ClockRef, KeyedAccount, QuoteParams, SwapMode};
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{account::Account, clock::Clock, pubkey as key, pubkey::Pubkey, sysvar::SysvarId};
+use std::collections::HashMap;
 
 #[test]
 fn test() {
@@ -14,6 +13,15 @@ fn test() {
 
     let clock = client.get_account(&Clock::id()).unwrap();
     let clock: Clock = clock.deserialize_data().unwrap();
+
+    let labels = HashMap::from([
+        (key!("9ZA9rqQdwBok9fet8Ukd3ETnzsRZv2ojRXkgMBFVUYPo"), "ADX"),
+        (key!("AmvN6hc814Go6fSvjAkQGY8EdhFcDk7BfKppLVpa8nsD"), "ALP"),
+        (key!("3jdYcGYZaQVvcvMQGqVpt37JegEoDDnX7k4gSGAeGRqG"), "USDC"),
+        (key!("HRHfoVPeLKKwHAMP1P5zsgG9w4HHSu93Merjxpt8u5a7"), "ETH"),
+        (key!("7MoYkgWVCEDtNR6i2WUH9LTUSFXkQCsD9tBHriHQvuP5"), "BTC"),
+        (key!("So11111111111111111111111111111111111111112"), "SOL"),
+    ]);
 
     let keyed_pool = KeyedAccount {
         account: pool_acc,
@@ -54,14 +62,26 @@ fn test() {
 
     let mints = amm.get_reserve_mints();
 
-    let quote = amm
-        .quote(&QuoteParams {
-            amount: 10000,
-            input_mint: mints[0],
-            output_mint: mints[1],
-            swap_mode: SwapMode::ExactIn, //TODO do exact out
-        })
-        .unwrap();
+    println!("====================================");
 
-    println!("{quote:?}");
+    for input_mint in &mints {
+        for output_mint in &mints {
+            if input_mint != output_mint {
+                println!(
+                    "INPUT: {}, OUTPUT: {}",
+                    labels[input_mint], labels[output_mint]
+                );
+                let quote = amm
+                    .quote(&QuoteParams {
+                        amount: 10000,
+                        input_mint: *input_mint,
+                        output_mint: *output_mint,
+                        swap_mode: SwapMode::ExactIn, //TODO do exact out
+                    })
+                    .unwrap();
+                println!("{quote:?}");
+                println!("====================================");
+            }
+        }
+    }
 }

@@ -108,7 +108,7 @@ fn test() {
 
     amm.update(&account_map).unwrap();
 
-    let accounts = amm.get_accounts_to_update();
+    let _accounts = amm.get_accounts_to_update();
 
     // assert_eq!(accounts[0], oracle_1.key);
     // assert_eq!(accounts[1], oracle_4.key);

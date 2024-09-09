@@ -25,13 +25,20 @@ const FEE_REDISTRIBUTION_MINT: Pubkey = key!("3jdYcGYZaQVvcvMQGqVpt37JegEoDDnX7k
 const REWARD_ORACLE_ACCOUNT: Pubkey = key!("5SSkXsEKQepHHAewytPVwdej4epN1nxgLVM84L4KXgy7");
 const LM_STAKING: Pubkey = key!("AUP8PVY9gC5VGmTdyZLVB2DskLeScKGxY5VeZtZN7hFR");
 
-//TODO: staking_reward_token_custody_oracle_account
-// const REWARD_ORACLE_ACCOUNT: Pubkey = key!("")
-
 #[derive(Clone, Debug)]
 pub enum UpdateStatus {
     Custodies,
     OraclesAndTokens,
+}
+
+pub struct CalculateFeesParams<'a> {
+    in_oracle: &'a OraclePrice,
+    in_decimals: u8,
+    int_amount: u64,
+    out_oracle: &'a OraclePrice,
+    out_decimals: u8,
+    out_amount: u64,
+    fees: (u64, u64),
 }
 
 #[derive(Clone)]
@@ -49,10 +56,67 @@ impl PoolAmm {
     fn pda(&self, seeds: &[&[u8]]) -> Pubkey {
         Pubkey::find_program_address(seeds, &self.program_id).0
     }
+
+    fn get_custody_and_oracle(
+        &self,
+        mint: Pubkey,
+    ) -> anyhow::Result<(Pubkey, &Custody, &OraclePrice)> {
+        let custody_key = self.pda(&[b"custody", self.key.as_ref(), mint.as_ref()]);
+
+        let custody = self
+            .custodies
+            .get(&custody_key)
+            .context(format!("Custody does not exist: {custody_key}"))?;
+
+        let oracle_price = self
+            .oracle_prices
+            .get(&custody.oracle.oracle_account)
+            .context(format!(
+                "Oracle does not exist: {}",
+                custody.oracle.oracle_account
+            ))?;
+
+        Ok((custody_key, custody, oracle_price))
+    }
+
+    fn calculate_fees(
+        &self,
+        CalculateFeesParams {
+            in_oracle,
+            in_decimals,
+            int_amount,
+            out_oracle,
+            out_decimals,
+            out_amount,
+            fees,
+        }: CalculateFeesParams,
+    ) -> anyhow::Result<(u64, Decimal)> {
+        let (_, fees_custody, fees_price) = self.get_custody_and_oracle(FEE_REDISTRIBUTION_MINT)?;
+
+        let fees_in_usd = in_oracle.get_asset_amount_usd(fees.0, in_decimals)?;
+        let fees_out_usd = out_oracle.get_asset_amount_usd(fees.1, out_decimals)?;
+        let in_usd = in_oracle.get_asset_amount_usd(int_amount, in_decimals)?;
+        let out_usd = out_oracle.get_asset_amount_usd(out_amount, out_decimals)?;
+
+        let total_amount = in_usd + out_usd;
+        let total_fees = fees_in_usd + fees_out_usd;
+
+        let total_amount_dec =
+            Decimal::from_u64(total_amount).context("Can't convert out_amount")?;
+        let total_fees_dec = Decimal::from_u64(total_fees).context("Can't convert out_amount")?;
+
+        let fee_pct = Decimal::ONE_HUNDRED
+            .checked_mul(total_fees_dec)
+            .and_then(|per| per.checked_div(total_amount_dec))
+            .context("Can't calculate fee percentage")?;
+
+        let reward_fees = fees_price.get_token_amount(total_fees, fees_custody.decimals)?;
+
+        Ok((reward_fees, fee_pct))
+    }
 }
 
 impl Amm for PoolAmm {
-    //TODO work with the new amm interface
     fn from_keyed_account(
         keyed_account: &jupiter_amm_interface::KeyedAccount,
         amm_context: &AmmContext,
@@ -177,36 +241,10 @@ impl Amm for PoolAmm {
         let custody_in_mint = quote_params.input_mint;
         let custody_out_mint = quote_params.output_mint;
 
-        let custody_in_pubkey =
-            self.pda(&[b"custody", self.key.as_ref(), custody_in_mint.as_ref()]);
-        let custody_out_pubkey =
-            self.pda(&[b"custody", self.key.as_ref(), custody_out_mint.as_ref()]);
-
-        let custody_in = self
-            .custodies
-            .get(&custody_in_pubkey)
-            .ok_or(anyhow!("Custody does not exist: {}", custody_in_pubkey))?;
-
-        let custody_out = self
-            .custodies
-            .get(&custody_out_pubkey)
-            .ok_or(anyhow!("Custody does not exist {}", custody_out_pubkey))?;
-
-        let token_price_in = self
-            .oracle_prices
-            .get(&custody_in.oracle.oracle_account)
-            .ok_or(anyhow!(
-                "Oracle does not exist: {}",
-                custody_in.oracle.oracle_account
-            ))?;
-
-        let token_price_out = self
-            .oracle_prices
-            .get(&custody_out.oracle.oracle_account)
-            .ok_or(anyhow!(
-                "Oracle does not exist: {}",
-                custody_out.oracle.oracle_account
-            ))?;
+        let (custody_in_pubkey, custody_in, token_price_in) =
+            self.get_custody_and_oracle(custody_in_mint)?;
+        let (custody_out_pubkey, custody_out, token_price_out) =
+            self.get_custody_and_oracle(custody_out_mint)?;
 
         let token_id_in = self.state.get_token_id(&custody_in_pubkey)?;
         let token_id_out = self.state.get_token_id(&custody_out_pubkey)?;
@@ -230,25 +268,26 @@ impl Amm for PoolAmm {
             &token_price_out,
         )?;
 
-        let fee_amount = fees.0 + fees.1;
+        let real_out_amount = out_amount - fees.1;
 
-        let in_dec =
-            Decimal::from_u64(quote_params.amount).with_context(|| "Can't convert out_amount")?;
-        let fee_dec = Decimal::from_u64(fee_amount).with_context(|| "Can't convert fee_amount")?;
-
-        let fee_pct = Decimal::ONE_HUNDRED
-            .checked_mul(fee_dec)
-            .and_then(|per| per.checked_div(in_dec))
-            .ok_or(anyhow!("Can't calculate fee percentage"))?;
+        let (fee_amount, fee_pct) = self.calculate_fees(CalculateFeesParams {
+            fees,
+            in_decimals: custody_in.decimals,
+            in_oracle: token_price_in,
+            int_amount: quote_params.amount,
+            out_amount,
+            out_decimals: custody_out.decimals,
+            out_oracle: token_price_out,
+        })?;
 
         let quote = Quote {
             fee_amount,
             min_out_amount: None,
             min_in_amount: None,
-            fee_mint: quote_params.input_mint,
+            fee_mint: FEE_REDISTRIBUTION_MINT,
             fee_pct,
             in_amount: quote_params.amount,
-            out_amount,
+            out_amount: real_out_amount,
         };
         Ok(quote)
     }
