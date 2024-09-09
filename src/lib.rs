@@ -29,19 +29,19 @@ const LM_STAKING: Pubkey = key!("AUP8PVY9gC5VGmTdyZLVB2DskLeScKGxY5VeZtZN7hFR");
 // const REWARD_ORACLE_ACCOUNT: Pubkey = key!("")
 
 #[derive(Clone, Debug)]
-pub enum UpdateStatus {
+pub enum UpdateType {
     Custodies,
     OraclesAndTokens,
 }
 
 #[derive(Clone)]
 pub struct PoolAmm {
-    key: Pubkey,
-    state: Pool,
+    pool_key: Pubkey,
+    pool: Pool,
     custodies: HashMap<Pubkey, Custody>,
     oracle_prices: HashMap<Pubkey, OraclePrice>,
     program_id: Pubkey,
-    update_status: UpdateStatus,
+    update_status: UpdateType,
     clock_ref: ClockRef,
 }
 
@@ -52,23 +52,19 @@ impl PoolAmm {
 }
 
 impl Amm for PoolAmm {
-    //TODO work with the new amm interface
-    fn from_keyed_account(
-        keyed_account: &jupiter_amm_interface::KeyedAccount,
-        amm_context: &AmmContext,
-    ) -> anyhow::Result<Self>
+    fn from_keyed_account(keyed_account: &KeyedAccount) -> Result<Self>
     where
-        Self: Sized,
+        Self: Sized;
     {
         let pool = Pool::try_deserialize(&mut &keyed_account.account.data[..])?;
 
         Ok(PoolAmm {
-            key: keyed_account.key,
+            pool_key: keyed_account.key,
             program_id: keyed_account.account.owner,
-            state: pool,
+            pool,
             custodies: HashMap::new(),
             oracle_prices: HashMap::new(),
-            update_status: UpdateStatus::Custodies,
+            update_type: UpdateType::Custodies,
             clock_ref: amm_context.clock_ref.clone(),
         })
     }
@@ -82,7 +78,7 @@ impl Amm for PoolAmm {
     }
 
     fn key(&self) -> Pubkey {
-        self.key
+        self.pool_key
     }
 
     fn requires_update_for_reserve_mints(&self) -> bool {
@@ -90,13 +86,15 @@ impl Amm for PoolAmm {
     }
 
     fn get_reserve_mints(&self) -> Vec<Pubkey> {
+        // Should all custodies be considered reserves? (Stable too?)
+        // Add ALP mint/redeem which is not a custody
         self.custodies.values().map(|c| c.mint).collect()
     }
 
     fn get_accounts_to_update(&self) -> Vec<Pubkey> {
-        match self.update_status {
-            UpdateStatus::Custodies => {
-                let mut keys = vec![self.key];
+        match self.update_type {
+            UpdateType::Custodies => {
+                let mut keys = vec![self.pool_key];
 
                 keys.append(
                     &mut self
@@ -108,12 +106,17 @@ impl Amm for PoolAmm {
                 );
                 keys
             }
-            UpdateStatus::OraclesAndTokens => self
+            UpdateType::OraclesAndTokens => self
                 .custodies
                 .values()
                 .map(|c| c.oracle.oracle_account)
                 .collect(),
         }
+    }
+
+    /// Indicates if get_accounts_to_update might return a non constant vec
+    fn has_dynamic_accounts(&self) -> bool {
+        true
     }
 
     fn update(&mut self, account_map: &jupiter_amm_interface::AccountMap) -> anyhow::Result<()> {
@@ -123,12 +126,12 @@ impl Amm for PoolAmm {
             .deserialize_data()?;
         self.clock_ref.update(clock);
 
-        match self.update_status {
-            UpdateStatus::Custodies => {
-                let pool_state =
-                    Pool::try_deserialize(&mut try_get_account_data(account_map, &self.key)?)?;
+        match self.update_type {
+            UpdateType::Custodies => {
+                let pool =
+                    Pool::try_deserialize(&mut try_get_account_data(account_map, &self.pool_key)?)?;
 
-                self.state = pool_state;
+                self.pool = pool;
 
                 for custody_key in &self.state.custodies {
                     if *custody_key != system_program::ID {
@@ -140,9 +143,9 @@ impl Amm for PoolAmm {
                     }
                 }
 
-                self.update_status = UpdateStatus::OraclesAndTokens;
+                self.update_type = UpdateType::OraclesAndTokens;
             }
-            UpdateStatus::OraclesAndTokens => {
+            UpdateType::OraclesAndTokens => {
                 let oracle_keys = self.custodies.values().map(|c| c.oracle.oracle_account);
 
                 for oracle_key in oracle_keys {
@@ -163,7 +166,7 @@ impl Amm for PoolAmm {
                     self.oracle_prices.insert(oracle_key, oracle_price);
                 }
 
-                self.update_status = UpdateStatus::Custodies;
+                self.update_type = UpdateType::Custodies;
             }
         }
 
@@ -178,9 +181,9 @@ impl Amm for PoolAmm {
         let custody_out_mint = quote_params.output_mint;
 
         let custody_in_pubkey =
-            self.pda(&[b"custody", self.key.as_ref(), custody_in_mint.as_ref()]);
+            self.pda(&[b"custody", self.pool_key.as_ref(), custody_in_mint.as_ref()]);
         let custody_out_pubkey =
-            self.pda(&[b"custody", self.key.as_ref(), custody_out_mint.as_ref()]);
+            self.pda(&[b"custody", self.pool_key.as_ref(), custody_out_mint.as_ref()]);
 
         let custody_in = self
             .custodies
@@ -257,7 +260,7 @@ impl Amm for PoolAmm {
         &self,
         swap_params: &jupiter_amm_interface::SwapParams,
     ) -> anyhow::Result<jupiter_amm_interface::SwapAndAccountMetas> {
-        let (dispensing_custody, dispensing_cust_state) = self
+        let (dispensing_custody, dispensing_custody_state) = self
             .custodies
             .iter()
             .find(|c| c.1.mint == swap_params.source_mint)
@@ -265,7 +268,7 @@ impl Amm for PoolAmm {
                 "Can't find the custody for the mint {}",
                 swap_params.source_mint
             ))?;
-        let (receiving_custody, receiving_cust_state) = self
+        let (receiving_custody, receiving_custody_state) = self
             .custodies
             .iter()
             .find(|c| c.1.mint == swap_params.destination_mint)
@@ -274,12 +277,7 @@ impl Amm for PoolAmm {
                 swap_params.destination_mint
             ))?;
 
-        let dispensing_custody_oracle_account = dispensing_cust_state.oracle.oracle_account;
-        let dispensing_custody_token_account = dispensing_cust_state.token_account;
-        let receiving_custody_oracle_account = receiving_cust_state.oracle.oracle_account;
-        let receiving_custody_token_account = receiving_cust_state.token_account;
-        let owner = swap_params.token_transfer_authority;
-        let lp_token_mint = self.pda(&[b"lp_token_mint", self.key.as_ref()]);
+        let lp_token_mint = self.pda(&[b"lp_token_mint", self.pool_key.as_ref()]);
         let lp_staking = self.pda(&[b"staking", lp_token_mint.as_ref()]);
         let cortex = self.pda(&[b"cortex"]);
         let user_profile = self.pda(&[b"user_profile", owner.as_ref()]);
@@ -289,33 +287,33 @@ impl Amm for PoolAmm {
             self.pda(&[b"staking_reward_token_vault", lp_staking.as_ref()]);
         let staking_reward_token_custody = self.pda(&[
             b"custody",
-            self.key.as_ref(),
+            self.pool_key.as_ref(),
             FEE_REDISTRIBUTION_MINT.as_ref(),
         ]);
         let staking_reward_token_custody_token_account = self.pda(&[
             b"custody_token_account",
-            self.key.as_ref(),
+            self.pool_key.as_ref(),
             FEE_REDISTRIBUTION_MINT.as_ref(),
         ]);
 
         let account_metas = Swap {
-            owner,
+            owner: swap_params.token_transfer_authority,
             funding_account: swap_params.source_token_account,
             receiving_account: swap_params.destination_token_account,
             transfer_authority: owner,
             cortex,
             lm_staking: LM_STAKING,
             lp_staking,
-            pool: self.key,
+            pool: self.pool_key,
             staking_reward_token_custody,
             staking_reward_token_custody_oracle_account: REWARD_ORACLE_ACCOUNT,
             staking_reward_token_custody_token_account,
             receiving_custody: *receiving_custody,
-            receiving_custody_oracle_account,
-            receiving_custody_token_account,
+            receiving_custody_oracle_account: receiving_custody_state.oracle.oracle_account,
+            receiving_custody_token_account: receiving_custody_state.token_account,
             dispensing_custody: *dispensing_custody,
-            dispensing_custody_oracle_account,
-            dispensing_custody_token_account,
+            dispensing_custody_oracle_account: dispensing_custody_state.oracle.oracle_account,
+            dispensing_custody_token_account: dispensing_custody_state.token_account,
             lm_staking_reward_token_vault,
             lp_staking_reward_token_vault,
             lp_token_mint,
