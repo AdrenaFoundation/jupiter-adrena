@@ -34,7 +34,7 @@ pub fn calculate_remove_liquidity(
     let remove_amount = token_price.get_token_amount(remove_amount_usd, custody.decimals)?;
     let fee_amount =
         amm.pool
-            .get_remove_liquidity_fee(token_id, remove_amount, &custody, &token_price)?;
+            .get_remove_liquidity_fee(token_id, remove_amount, custody, &token_price)?;
     let out_amount = remove_amount - fee_amount;
 
     let fee_amount_usd = token_price.get_asset_amount_usd(fee_amount, custody.decimals)?;
