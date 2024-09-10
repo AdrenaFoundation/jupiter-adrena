@@ -19,12 +19,13 @@ fn test() {
         (key!("4kUrHxiMfeKPGDi6yFV7kte8JjN3NG3aqG7bui4pfMqz"), "BONK"),
         (key!("7MoYkgWVCEDtNR6i2WUH9LTUSFXkQCsD9tBHriHQvuP5"), "BTC"),
         (key!("So11111111111111111111111111111111111111112"), "SOL"),
+        (key!("HNyQyAanLYHPjoXtw2V6pAdv8d925z1ytYpw1uRftv2N"), "ALP"),
     ]);
 
     let amount = HashMap::from([
-        (("USDC", "BONK"), 0),
-        (("USDC", "BTC"), 50000),
-        (("USDC", "SOL"), 1000),
+        (("SOL", "BONK"), 10_000_000_000),
+        (("SOL", "BTC"), 10_000_000_000),
+        (("SOL", "USDC"), 10_000_000_000),
     ]);
     let keyed_pool = KeyedAccount {
         account: pool_acc,
@@ -41,6 +42,8 @@ fn test() {
     .unwrap();
 
     let accounts = amm.get_accounts_to_update();
+
+    println!("{:?}", accounts);
 
     let account_map: HashMap<Pubkey, Account> = accounts
         .into_iter()
@@ -62,26 +65,52 @@ fn test() {
 
     println!("====================================");
 
-    // USDC
-    let input_mint = key!("3jdYcGYZaQVvcvMQGqVpt37JegEoDDnX7k4gSGAeGRqG");
+    // SOL
+    let input_mint = key!("So11111111111111111111111111111111111111112");
 
     for output_mint in &mints {
         if &input_mint != output_mint {
             let input_label = labels[&input_mint];
             let output_label = labels[output_mint];
 
-            println!("INPUT: {}, OUTPUT: {}", input_label, output_label);
-            let amount = amount[&(input_label, output_label)];
-            let quote = amm
-                .quote(&QuoteParams {
-                    amount,
-                    input_mint: input_mint,
-                    output_mint: *output_mint,
-                    swap_mode: SwapMode::ExactIn, //TODO do exact out
-                })
-                .unwrap();
-            println!("{quote:?}");
-            println!("====================================");
+            if output_label != "BONK" {
+                println!("INPUT: {}, OUTPUT: {}", input_label, output_label);
+                let amount = amount[&(input_label, output_label)];
+                let quote = amm
+                    .quote(&QuoteParams {
+                        amount,
+                        input_mint,
+                        output_mint: *output_mint,
+                        swap_mode: SwapMode::ExactIn, //TODO do exact out
+                    })
+                    .unwrap();
+                println!("{quote:?}");
+                println!("====================================");
+            }
         }
     }
+
+    println!("INPUT: LP, OUTPUT: SOL");
+    let quote = amm
+        .quote(&QuoteParams {
+            amount: 1_000_000_000,
+            input_mint: key!("HNyQyAanLYHPjoXtw2V6pAdv8d925z1ytYpw1uRftv2N"),
+            output_mint: key!("So11111111111111111111111111111111111111112"),
+            swap_mode: SwapMode::ExactIn, //TODO do exact out
+        })
+        .unwrap();
+    println!("{quote:?}");
+    println!("====================================");
+
+    println!("INPUT: SOL, OUTPUT: LP");
+    let quote = amm
+        .quote(&QuoteParams {
+            amount: 1_000_000_000,
+            input_mint: key!("So11111111111111111111111111111111111111112"),
+            output_mint: key!("HNyQyAanLYHPjoXtw2V6pAdv8d925z1ytYpw1uRftv2N"),
+            swap_mode: SwapMode::ExactIn, //TODO do exact out
+        })
+        .unwrap();
+    println!("{quote:?}");
+    println!("====================================");
 }

@@ -1,14 +1,17 @@
-use adrena::{
-    accounts::Swap,
-    state::{custody::Custody, oracle::OraclePrice, pool::Pool},
-};
-use anchor_lang::{system_program, AccountDeserialize, ToAccountMetas};
-use anyhow::anyhow;
+mod quote;
+
+use adrena::state::{custody::Custody, oracle::OraclePrice, pool::Pool};
+use anchor_lang::{system_program, AccountDeserialize};
 use anyhow::Context;
 use jupiter_amm_interface::{try_get_account_data, Amm, AmmContext, Quote, SwapAndAccountMetas};
 use num_traits::FromPrimitive;
+use quote::{
+    calculate_add_liquidity, calculate_remove_liquidity, calculate_swap, get_add_liquidity_metas,
+    get_remove_liquidity_metas, get_swap_metas, ComputeResult,
+};
 use rust_decimal::Decimal;
 use solana_sdk::{account_info::IntoAccountInfo, pubkey as key, pubkey::Pubkey};
+use spl_token::{solana_program::program_pack::Pack, state::Mint};
 use std::collections::HashMap;
 
 const SPL_TOKEN_ID: Pubkey = key!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
@@ -27,7 +30,7 @@ pub enum UpdateType {
 pub struct CalculateFeesParams<'a> {
     in_oracle: &'a OraclePrice,
     in_decimals: u8,
-    int_amount: u64,
+    in_amount: u64,
     out_oracle: &'a OraclePrice,
     out_decimals: u8,
     out_amount: u64,
@@ -40,6 +43,7 @@ pub struct PoolAmm {
     pool: Pool,
     custodies: HashMap<Pubkey, Custody>,
     oracle_prices: HashMap<Pubkey, OraclePrice>,
+    lp_token_mint: (Pubkey, Option<Mint>),
     program_id: Pubkey,
     update_type: UpdateType,
 }
@@ -71,12 +75,12 @@ impl PoolAmm {
         Ok((custody_key, custody, oracle_price))
     }
 
-    fn calculate_fees(
+    fn calculate_swap_fees(
         &self,
         CalculateFeesParams {
             in_oracle,
             in_decimals,
-            int_amount,
+            in_amount,
             out_oracle,
             out_decimals,
             out_amount,
@@ -87,7 +91,7 @@ impl PoolAmm {
 
         let fees_in_usd = in_oracle.get_asset_amount_usd(fees.0, in_decimals)?;
         let fees_out_usd = out_oracle.get_asset_amount_usd(fees.1, out_decimals)?;
-        let in_usd = in_oracle.get_asset_amount_usd(int_amount, in_decimals)?;
+        let in_usd = in_oracle.get_asset_amount_usd(in_amount, in_decimals)?;
         let out_usd = out_oracle.get_asset_amount_usd(out_amount, out_decimals)?;
 
         let total_amount = in_usd + out_usd;
@@ -113,14 +117,21 @@ impl Amm for PoolAmm {
         keyed_account: &jupiter_amm_interface::KeyedAccount,
         _amm_context: &AmmContext,
     ) -> anyhow::Result<Self> {
+        let program_id = keyed_account.account.owner;
+        let pool_key = keyed_account.key;
         let pool = Pool::try_deserialize(&mut &keyed_account.account.data[..])?;
+        let lp_token_mint = Pubkey::create_program_address(
+            &[b"lp_token_mint", pool_key.as_ref(), &[pool.lp_token_bump]],
+            &program_id,
+        )?;
 
         Ok(PoolAmm {
             pool_key: keyed_account.key,
-            program_id: keyed_account.account.owner,
+            program_id,
             pool,
             custodies: HashMap::new(),
             oracle_prices: HashMap::new(),
+            lp_token_mint: (lp_token_mint, None),
             update_type: UpdateType::Custodies,
         })
     }
@@ -150,7 +161,7 @@ impl Amm for PoolAmm {
     fn get_accounts_to_update(&self) -> Vec<Pubkey> {
         match self.update_type {
             UpdateType::Custodies => {
-                let mut keys = vec![self.pool_key];
+                let mut keys = vec![self.pool_key, self.lp_token_mint.0];
 
                 keys.append(
                     &mut self
@@ -182,6 +193,11 @@ impl Amm for PoolAmm {
                     Pool::try_deserialize(&mut try_get_account_data(account_map, &self.pool_key)?)?;
 
                 self.pool = pool;
+
+                self.lp_token_mint.1 = Some(Mint::unpack(&mut try_get_account_data(
+                    account_map,
+                    &self.lp_token_mint.0,
+                )?)?);
 
                 for custody_key in &self.pool.custodies {
                     if *custody_key != system_program::ID {
@@ -222,139 +238,45 @@ impl Amm for PoolAmm {
         &self,
         quote_params: &jupiter_amm_interface::QuoteParams,
     ) -> anyhow::Result<jupiter_amm_interface::Quote> {
-        let custody_in_mint = quote_params.input_mint;
-        let custody_out_mint = quote_params.output_mint;
+        let lp_token_mint_key = self.lp_token_mint.0;
 
-        let (custody_in_pubkey, custody_in, token_price_in) =
-            self.get_custody_and_oracle(custody_in_mint)?;
-        let (custody_out_pubkey, custody_out, token_price_out) =
-            self.get_custody_and_oracle(custody_out_mint)?;
-
-        let token_id_in = self.pool.get_token_id(&custody_in_pubkey)?;
-        let token_id_out = self.pool.get_token_id(&custody_out_pubkey)?;
-
-        let out_amount = self.pool.get_swap_amount(
-            token_price_in,
-            token_price_out,
-            custody_in,
-            custody_out,
-            quote_params.amount,
-        )?;
-
-        let fees = {
-            let swap_fees_in = self.pool.get_swap_in_fees(
-                token_id_in,
-                quote_params.amount,
-                custody_in,
-                token_price_in,
-                custody_out,
-            )?;
-
-            let swap_fees_out = self.pool.get_swap_out_fees(
-                token_id_out,
-                out_amount,
-                custody_in,
-                custody_out,
-                token_price_out,
-            )?;
-
-            (swap_fees_in, swap_fees_out)
-        };
-
-        let real_out_amount = out_amount - fees.1;
-
-        let (fee_amount, fee_pct) = self.calculate_fees(CalculateFeesParams {
-            fees,
-            in_decimals: custody_in.decimals,
-            in_oracle: token_price_in,
-            int_amount: quote_params.amount,
+        let ComputeResult {
+            in_amount,
             out_amount,
-            out_decimals: custody_out.decimals,
-            out_oracle: token_price_out,
-        })?;
-
-        let quote = Quote {
             fee_amount,
-            min_out_amount: None,
+            fee_pct,
+        } = if lp_token_mint_key == quote_params.input_mint {
+            calculate_remove_liquidity(&self, quote_params)
+        } else if lp_token_mint_key == quote_params.output_mint {
+            calculate_add_liquidity(&self, quote_params)
+        } else {
+            calculate_swap(&self, quote_params)
+        }?;
+
+        Ok(Quote {
             min_in_amount: None,
+            min_out_amount: None,
+            in_amount,
+            out_amount,
+            fee_amount,
             fee_mint: FEE_REDISTRIBUTION_MINT,
             fee_pct,
-            in_amount: quote_params.amount,
-            out_amount: real_out_amount,
-        };
-        Ok(quote)
+        })
     }
 
     fn get_swap_and_account_metas(
         &self,
         swap_params: &jupiter_amm_interface::SwapParams,
     ) -> anyhow::Result<jupiter_amm_interface::SwapAndAccountMetas> {
-        let (dispensing_custody, dispensing_custody_state) = self
-            .custodies
-            .iter()
-            .find(|c| c.1.mint == swap_params.source_mint)
-            .ok_or(anyhow!(
-                "Can't find the custody for the mint {}",
-                swap_params.source_mint
-            ))?;
-        let (receiving_custody, receiving_custody_state) = self
-            .custodies
-            .iter()
-            .find(|c| c.1.mint == swap_params.destination_mint)
-            .ok_or(anyhow!(
-                "Can't find the custody for the mint {}",
-                swap_params.destination_mint
-            ))?;
+        let lp_token_mint_key = self.lp_token_mint.0;
 
-        let lp_token_mint = self.pda(&[b"lp_token_mint", self.pool_key.as_ref()]);
-        let lp_staking = self.pda(&[b"staking", lp_token_mint.as_ref()]);
-        let cortex = self.pda(&[b"cortex"]);
-        let user_profile = self.pda(&[
-            b"user_profile",
-            swap_params.token_transfer_authority.as_ref(),
-        ]);
-        let lm_staking_reward_token_vault =
-            self.pda(&[b"staking_reward_token_vault", LM_STAKING.as_ref()]);
-        let lp_staking_reward_token_vault =
-            self.pda(&[b"staking_reward_token_vault", lp_staking.as_ref()]);
-        let staking_reward_token_custody = self.pda(&[
-            b"custody",
-            self.pool_key.as_ref(),
-            FEE_REDISTRIBUTION_MINT.as_ref(),
-        ]);
-        let staking_reward_token_custody_token_account = self.pda(&[
-            b"custody_token_account",
-            self.pool_key.as_ref(),
-            FEE_REDISTRIBUTION_MINT.as_ref(),
-        ]);
-
-        let account_metas = Swap {
-            owner: swap_params.token_transfer_authority,
-            funding_account: swap_params.source_token_account,
-            receiving_account: swap_params.destination_token_account,
-            transfer_authority: swap_params.token_transfer_authority,
-            cortex,
-            lm_staking: LM_STAKING,
-            lp_staking,
-            pool: self.pool_key,
-            staking_reward_token_custody,
-            staking_reward_token_custody_oracle_account: REWARD_ORACLE_ACCOUNT,
-            staking_reward_token_custody_token_account,
-            receiving_custody: *receiving_custody,
-            receiving_custody_oracle_account: receiving_custody_state.oracle.oracle_account,
-            receiving_custody_token_account: receiving_custody_state.token_account,
-            dispensing_custody: *dispensing_custody,
-            dispensing_custody_oracle_account: dispensing_custody_state.oracle.oracle_account,
-            dispensing_custody_token_account: dispensing_custody_state.token_account,
-            lm_staking_reward_token_vault,
-            lp_staking_reward_token_vault,
-            lp_token_mint,
-            protocol_fee_recipient: PROTOCOL_FEE_RECIPIENT,
-            user_profile: Some(user_profile),
-            token_program: SPL_TOKEN_ID,
-            adrena_program: self.program_id,
-        }
-        .to_account_metas(None);
+        let account_metas = if lp_token_mint_key == swap_params.source_mint {
+            get_remove_liquidity_metas(&self, swap_params)
+        } else if lp_token_mint_key == swap_params.destination_mint {
+            get_add_liquidity_metas(&self, swap_params)
+        } else {
+            get_swap_metas(&self, swap_params)
+        }?;
 
         Ok(SwapAndAccountMetas {
             swap: jupiter_amm_interface::Swap::Saber, //TODO Switch to Adrena
