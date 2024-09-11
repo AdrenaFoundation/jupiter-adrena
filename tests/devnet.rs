@@ -8,21 +8,25 @@ use std::collections::HashMap;
 fn test() {
     let client = RpcClient::new("https://api.devnet.solana.com");
 
-    let pool_key = key!("22h3wdapjk9e4TPEtEmFcXB1dCZZEShCtGptdBCvWNQr");
+    let pool_key = key!("2buhqUduNw7wNhZ1ixFxfvLRX3gAZkGmg8G1Rv5SEur7");
     let pool_acc = client.get_account(&pool_key).unwrap();
 
     let clock = client.get_account(&Clock::id()).unwrap();
     let clock: Clock = clock.deserialize_data().unwrap();
 
     let labels = HashMap::from([
-        (key!("9ZA9rqQdwBok9fet8Ukd3ETnzsRZv2ojRXkgMBFVUYPo"), "ADX"),
-        (key!("AmvN6hc814Go6fSvjAkQGY8EdhFcDk7BfKppLVpa8nsD"), "ALP"),
         (key!("3jdYcGYZaQVvcvMQGqVpt37JegEoDDnX7k4gSGAeGRqG"), "USDC"),
-        (key!("HRHfoVPeLKKwHAMP1P5zsgG9w4HHSu93Merjxpt8u5a7"), "ETH"),
+        (key!("4kUrHxiMfeKPGDi6yFV7kte8JjN3NG3aqG7bui4pfMqz"), "BONK"),
         (key!("7MoYkgWVCEDtNR6i2WUH9LTUSFXkQCsD9tBHriHQvuP5"), "BTC"),
         (key!("So11111111111111111111111111111111111111112"), "SOL"),
+        (key!("HNyQyAanLYHPjoXtw2V6pAdv8d925z1ytYpw1uRftv2N"), "ALP"),
     ]);
 
+    let amount = HashMap::from([
+        (("SOL", "BONK"), 10_000_000_000),
+        (("SOL", "BTC"), 10_000_000_000),
+        (("SOL", "USDC"), 10_000_000_000),
+    ]);
     let keyed_pool = KeyedAccount {
         account: pool_acc,
         key: pool_key,
@@ -39,24 +43,21 @@ fn test() {
 
     let accounts = amm.get_accounts_to_update();
 
-    let mut account_map: HashMap<Pubkey, Account> = accounts
+    println!("{:?}", accounts);
+
+    let account_map: HashMap<Pubkey, Account> = accounts
         .into_iter()
         .map(|p| (p, client.get_account(&p).unwrap()))
         .collect();
-
-    let clock = client.get_account(&Clock::id()).unwrap();
-    account_map.insert(Clock::id(), clock);
 
     amm.update(&account_map).unwrap();
 
     let accounts = amm.get_accounts_to_update();
 
-    let mut account_map: HashMap<Pubkey, Account> = accounts
+    let account_map: HashMap<Pubkey, Account> = accounts
         .into_iter()
         .map(|p| (p, client.get_account(&p).unwrap()))
         .collect();
-    let clock = client.get_account(&Clock::id()).unwrap();
-    account_map.insert(Clock::id(), clock);
 
     amm.update(&account_map).unwrap();
 
@@ -64,17 +65,21 @@ fn test() {
 
     println!("====================================");
 
-    for input_mint in &mints {
-        for output_mint in &mints {
-            if input_mint != output_mint {
-                println!(
-                    "INPUT: {}, OUTPUT: {}",
-                    labels[input_mint], labels[output_mint]
-                );
+    // SOL
+    let input_mint = key!("So11111111111111111111111111111111111111112");
+
+    for output_mint in &mints {
+        if &input_mint != output_mint {
+            let input_label = labels[&input_mint];
+            let output_label = labels[output_mint];
+
+            if output_label != "BONK" {
+                println!("INPUT: {}, OUTPUT: {}", input_label, output_label);
+                let amount = amount[&(input_label, output_label)];
                 let quote = amm
                     .quote(&QuoteParams {
-                        amount: 10000,
-                        input_mint: *input_mint,
+                        amount,
+                        input_mint,
                         output_mint: *output_mint,
                         swap_mode: SwapMode::ExactIn, //TODO do exact out
                     })
@@ -84,4 +89,28 @@ fn test() {
             }
         }
     }
+
+    println!("INPUT: LP, OUTPUT: SOL");
+    let quote = amm
+        .quote(&QuoteParams {
+            amount: 1_000_000_000,
+            input_mint: key!("HNyQyAanLYHPjoXtw2V6pAdv8d925z1ytYpw1uRftv2N"),
+            output_mint: key!("So11111111111111111111111111111111111111112"),
+            swap_mode: SwapMode::ExactIn, //TODO do exact out
+        })
+        .unwrap();
+    println!("{quote:?}");
+    println!("====================================");
+
+    println!("INPUT: SOL, OUTPUT: LP");
+    let quote = amm
+        .quote(&QuoteParams {
+            amount: 1_000_000_000,
+            input_mint: key!("So11111111111111111111111111111111111111112"),
+            output_mint: key!("HNyQyAanLYHPjoXtw2V6pAdv8d925z1ytYpw1uRftv2N"),
+            swap_mode: SwapMode::ExactIn, //TODO do exact out
+        })
+        .unwrap();
+    println!("{quote:?}");
+    println!("====================================");
 }
