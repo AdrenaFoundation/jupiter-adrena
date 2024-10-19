@@ -13,7 +13,7 @@ spl-token = "=5.0"
 anyhow = "1.0"
 num-traits = "0.2"
 rust_decimal = "1.36"
-adrena = { git = "ssh://git@github.com/AdrenaFoundation/adrena.git", branch = "release/1", features = [
+adrena = { git = "ssh://git@github.com/AdrenaFoundation/adrena.git", features = [
     "no-entrypoint",
 ] }
 

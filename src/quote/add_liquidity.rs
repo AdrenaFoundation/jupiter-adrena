@@ -105,10 +105,8 @@ pub fn get_add_liquidity_metas(
         cortex,
         pool: amm.pool_key,
         staking_reward_token_custody,
-        staking_reward_token_custody_oracle_account: REWARD_ORACLE_ACCOUNT,
         staking_reward_token_custody_token_account,
         custody: *dispensing_custody,
-        custody_oracle_account: dispensing_custody_state.oracle.oracle_account,
         custody_token_account: params.source_token_account,
         lm_staking_reward_token_vault,
         lp_staking_reward_token_vault,
@@ -117,6 +115,8 @@ pub fn get_add_liquidity_metas(
         protocol_fee_recipient: PROTOCOL_FEE_RECIPIENT,
         token_program: SPL_TOKEN_ID,
         adrena_program: amm.program_id,
+        staking_reward_token_custody_oracle: REWARD_ORACLE_ACCOUNT,
+        custody_oracle: dispensing_custody_state.oracle,
     }
     .to_account_metas(None))
 }
