@@ -34,7 +34,7 @@ pub fn calculate_remove_liquidity(
     let remove_amount = token_price.get_token_amount(remove_amount_usd, custody.decimals)?;
     let fee_amount =
         amm.pool
-            .get_remove_liquidity_fee(token_id, remove_amount, custody, &token_price)?;
+            .get_remove_liquidity_fee(token_id, remove_amount, custody, token_price)?;
     let out_amount = remove_amount - fee_amount;
 
     let fee_amount_usd = token_price.get_asset_amount_usd(fee_amount, custody.decimals)?;
@@ -96,10 +96,8 @@ pub fn get_remove_liquidity_metas(
         cortex,
         pool: amm.pool_key,
         staking_reward_token_custody,
-        staking_reward_token_custody_oracle_account: REWARD_ORACLE_ACCOUNT,
         staking_reward_token_custody_token_account,
         custody: *receiving_custody,
-        custody_oracle_account: receiving_custody_state.oracle.oracle_account,
         custody_token_account: params.destination_token_account,
         lm_staking_reward_token_vault,
         lp_staking_reward_token_vault,
@@ -108,6 +106,8 @@ pub fn get_remove_liquidity_metas(
         token_program: SPL_TOKEN_ID,
         adrena_program: amm.program_id,
         receiving_account: params.destination_token_account,
+        staking_reward_token_custody_oracle: REWARD_ORACLE_ACCOUNT,
+        custody_oracle: receiving_custody_state.oracle,
     }
     .to_account_metas(None))
 }

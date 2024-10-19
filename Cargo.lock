@@ -29,8 +29,8 @@ checksum = "512761e0bb2578dd7380c6baaa0f4ce03e84f95e960231d1dec8bf4d7d6e2627"
 
 [[package]]
 name = "adrena"
-version = "1.0.0"
-source = "git+ssh://git@github.com/AdrenaFoundation/adrena.git?branch=release/1#a01cdecc3dfa78eba2864acca80e34423f99a4c8"
+version = "1.0.11"
+source = "git+ssh://git@github.com/AdrenaFoundation/adrena.git#34d55495d68eb538a7b1d62ef180916be54d76ec"
 dependencies = [
  "anchor-lang",
  "anchor-spl",
@@ -40,6 +40,7 @@ dependencies = [
  "num-traits",
  "pyth-solana-receiver-sdk",
  "sablier-sdk",
+ "sablier-thread-program",
  "solana-program 1.18.22",
  "solana-security-txt",
  "spl-governance",
